@@ -1,0 +1,10 @@
+# Archivos locales que no deben subirse
+config
+*.qcow2
+*.iso
+*.vmdk
+*.ova
+*.bin
+*.image
+*.swp
+.DS_Store

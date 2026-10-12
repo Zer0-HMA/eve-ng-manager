@@ -1,0 +1,14 @@
+# Copia este archivo a ~/.config/eve-ng-manager/config y ajusta lo que necesites.
+# Solo descomenta las líneas que quieras cambiar.
+
+# Nombre de la VM en libvirt (lo ves con: virsh list --all)
+#VM="eve-ng"
+
+# Conexión de libvirt
+#CONN="qemu:///system"
+
+# Usuario SSH dentro de EVE-NG
+#EVE_USER="root"
+
+# IP a usar si no se detecta automáticamente
+#FALLBACK_IP="192.168.122.98"   # solo si la IP no se detecta sola

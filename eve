@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+#  eve — Lanzador y gestor de imágenes para EVE-NG (libvirt/KVM)
+#  Enciende la VM, abre la web y te deja subir imágenes mientras
+#  trabajas. Si la VM se apaga, el script lo detecta y se cierra.
+# ──────────────────────────────────────────────────────────────
+set -uo pipefail
+
+# ── Configuración ────────────────────────────────────────────
+VM="eve-ng"
+CONN="qemu:///system"
+EVE_USER="root"
+FALLBACK_IP=""   # opcional, se puede fijar en el archivo de config
+ADDONS="/opt/unetlab/addons"
+SSH_SOCK="/tmp/eve-ssh-%r@%h:%p"
+IP=""
+
+# Permite cambiar la configuración sin tocar el script
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/eve-ng-manager/config"
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# ── Colores y mensajes ───────────────────────────────────────
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; M=$'\e[35m'; C=$'\e[36m'
+D=$'\e[2m'; BD=$'\e[1m'; N=$'\e[0m'
+info(){ echo "${C}➜${N} $*" >&2; }
+ok()  { echo "${G}✔${N} $*" >&2; }
+warn(){ echo "${Y}⚠${N} $*" >&2; }
+err() { echo "${R}✘${N} $*" >&2; }
+pause(){ read -r -p "${D}Enter para volver al menú...${N}" _; }
+
+# ── virsh (con sudo solo si hace falta) ──────────────────────
+SUDO_MODE=0
+if env LC_ALL=C virsh -c "$CONN" list &>/dev/null; then
+  VIRSH=(env LC_ALL=C virsh -c "$CONN")
+else
+  SUDO_MODE=1
+  warn "Tu usuario no está en el grupo 'libvirt', usaré sudo."
+  sudo -v || exit 1
+  VIRSH=(sudo -n env LC_ALL=C virsh -c "$CONN")
+fi
+refresh_sudo(){ (( SUDO_MODE )) && sudo -v; return 0; }
+
+vm_state(){ "${VIRSH[@]}" domstate "$VM" 2>/dev/null | head -1; }
+is_running(){ [[ "$(vm_state)" == "running" ]]; }
+# Para el monitoreo: si no se puede consultar (sudo caducado), asumimos que sigue viva
+still_alive(){ local s; s=$(vm_state); [[ -z "$s" || "$s" == "running" ]]; }
+
+get_ip(){
+  "${VIRSH[@]}" domifaddr "$VM" 2>/dev/null \
+    | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}'
+}
+port_open(){ timeout 2 bash -c "</dev/tcp/$1/$2" &>/dev/null; }
+
+# ── SSH (una sola contraseña por sesión gracias a ControlMaster) ──
+SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$SSH_SOCK"
+          -o ControlPersist=60m -o StrictHostKeyChecking=accept-new)
+rssh(){ ssh "${SSH_OPTS[@]}" "$EVE_USER@$IP" "$@"; }
+QI='QI=$(command -v qemu-img || echo /opt/qemu/bin/qemu-img);'
+
+open_ssh_master(){
+  ssh "${SSH_OPTS[@]}" -O check "$EVE_USER@$IP" &>/dev/null && return 0
+  info "Conectando por SSH a $IP (si te pide contraseña, es la de root de EVE-NG)"
+  ssh "${SSH_OPTS[@]}" -fN "$EVE_USER@$IP"
+}
+
+fixperms(){
+  info "Arreglando permisos en EVE-NG..."
+  rssh "/opt/unetlab/wrappers/unl_wrapper -a fixpermissions" &>/dev/null \
+    && ok "Permisos listos" || warn "No se pudieron arreglar los permisos"
+}
+
+upload(){ # upload <archivo_local> <carpeta_remota> [nombre_remoto]
+  local src="$1" dir="$2" name="${3:-$(basename "$1")}"
+  rssh "mkdir -p '$dir'" || return 1
+  info "Subiendo $(basename "$src") ($(du -h "$src" | cut -f1)) → $dir/$name"
+  if command -v rsync &>/dev/null && rssh "command -v rsync" &>/dev/null; then
+    rsync -hs --partial --info=progress2 -e "ssh ${SSH_OPTS[*]}" \
+      "$src" "$EVE_USER@$IP:$dir/$name"
+  else
+    scp "${SSH_OPTS[@]}" "$src" "$EVE_USER@$IP:$dir/$name"
+  fi
+}
+
+pick_file(){
+  local f
+  read -e -r -p "Ruta del archivo (Tab autocompleta, o arrástralo aquí): " f
+  f="${f#file://}"; f="${f//%20/ }"; f="${f//\\ / }"
+  f="${f//\'/}"; f="${f//\"/}"
+  f="${f%"${f##*[![:space:]]}"}"; f="${f#"${f%%[![:space:]]*}"}"
+  f="${f/#\~/$HOME}"
+  [[ -f "$f" ]] || { err "No existe: $f"; return 1; }
+  echo "$f"
+}
+
+# ── Plantillas QEMU (prefijo|descripción|disco por defecto) ──
+PREFIXES=(
+  "vios|Cisco vIOS router|virtioa.qcow2"
+  "viosl2|Cisco vIOS switch L2|virtioa.qcow2"
+  "csr1000vng|Cisco CSR1000v|virtioa.qcow2"
+  "c8000v|Cisco Catalyst 8000v|virtioa.qcow2"
+  "xrv9k|Cisco XRv 9000|virtioa.qcow2"
+  "nxosv9k|Cisco Nexus 9000v|sataa.qcow2"
+  "asav|Cisco ASAv|virtioa.qcow2"
+  "fortinet|Fortinet FortiGate|virtioa.qcow2"
+  "paloalto|Palo Alto|virtioa.qcow2"
+  "mikrotik|MikroTik CHR|hda.qcow2"
+  "vyos|VyOS|virtioa.qcow2"
+  "pfsense|pfSense|virtioa.qcow2"
+  "linux|Linux (cualquier distro)|virtioa.qcow2"
+  "win|Windows cliente|virtioa.qcow2"
+  "winserver|Windows Server|virtioa.qcow2"
+)
+SEL_PREFIX=""; SEL_DISK=""
+choose_prefix(){
+  echo "${BD}Tipo de equipo:${N}" >&2
+  local i=1 p
+  for p in "${PREFIXES[@]}"; do
+    IFS='|' read -r pre desc _ <<<"$p"
+    printf "  %2d) %-12s ${D}%s${N}\n" "$i" "$pre" "$desc" >&2; ((i++))
+  done
+  echo "   o) otro (escribir el prefijo)" >&2
+  local c; read -r -p "> " c
+  if [[ "$c" == o ]]; then
+    read -r -p "Prefijo: " SEL_PREFIX; SEL_DISK="virtioa.qcow2"
+  elif [[ "$c" =~ ^[0-9]+$ ]] && (( c>=1 && c<=${#PREFIXES[@]} )); then
+    IFS='|' read -r SEL_PREFIX _ SEL_DISK <<<"${PREFIXES[c-1]}"
+  else
+    err "Opción inválida"; return 1
+  fi
+  [[ -n "$SEL_PREFIX" ]]
+}
+
+ask_dir(){ # define DIR y DISK a partir del prefijo elegido
+  local ver
+  read -r -p "Versión o nombre (ej: 15.9, 7.2.5, ubuntu22): " ver
+  ver="${ver// /_}"; [[ -n "$ver" ]] || { err "Falta el nombre"; return 1; }
+  DIR="$ADDONS/qemu/${SEL_PREFIX}-${ver}"
+  read -r -p "Nombre del disco [$SEL_DISK]: " DISK; DISK="${DISK:-$SEL_DISK}"
+  if rssh "[ -e '$DIR/$DISK' ]"; then
+    local c; read -r -p "${Y}Ya existe $DIR/$DISK. ¿Sobrescribir? [s/N]:${N} " c
+    [[ "$c" =~ ^[sS]$ ]] || return 1
+  fi
+}
+
+# ── Acciones del menú ────────────────────────────────────────
+upload_qemu(){
+  local f ext; f=$(pick_file) || return
+  choose_prefix && ask_dir || return
+  ext="${f##*.}"; ext="${ext,,}"
+  case "$ext" in
+    qcow2) upload "$f" "$DIR" "$DISK" || return ;;
+    vmdk|img|raw|vhd|vhdx|vdi)
+      upload "$f" "$DIR" "tmp.$ext" || return
+      info "Convirtiendo .$ext a qcow2 dentro de EVE-NG..."
+      rssh "$QI cd '$DIR' && \$QI convert -p -O qcow2 tmp.$ext '$DISK' && rm -f tmp.$ext" || return ;;
+    ova)
+      upload "$f" "$DIR" "tmp.ova" || return
+      info "Extrayendo OVA y convirtiendo a qcow2..."
+      rssh "$QI cd '$DIR' && tar -xf tmp.ova && v=\$(ls *.vmdk | head -1) && \$QI convert -p -O qcow2 \"\$v\" '$DISK' && rm -f tmp.ova *.vmdk *.ovf *.mf" || return ;;
+    *) err "Formato .$ext no soportado para QEMU"; return ;;
+  esac
+  fixperms; ok "Imagen lista: ${BD}$(basename "$DIR")${N}"
+}
+
+upload_iso(){
+  local f size; f=$(pick_file) || return
+  [[ "${f,,}" == *.iso ]] || warn "El archivo no termina en .iso, sigo de todos modos."
+  choose_prefix && ask_dir || return
+  read -r -p "Tamaño del disco a crear [40G]: " size; size="${size:-40G}"
+  upload "$f" "$DIR" "cdrom.iso" || return
+  rssh "$QI cd '$DIR' && { [ -f '$DISK' ] || \$QI create -f qcow2 '$DISK' $size; }" >/dev/null || return
+  fixperms
+  ok "Lista para instalar: ${BD}$(basename "$DIR")${N}"
+  info "Crea un nodo con esta imagen, instala el sistema y después haz 'commit' para guardarlo."
+}
+
+upload_iol(){
+  local f name; f=$(pick_file) || return
+  name="$(basename "$f")"; name="${name// /_}"
+  upload "$f" "$ADDONS/iol/bin" "$name" || return
+  fixperms
+  rssh "[ -f $ADDONS/iol/bin/iourc ]" \
+    || warn "No hay archivo de licencia 'iourc' en $ADDONS/iol/bin; las imágenes IOL no arrancarán sin él."
+  ok "IOL lista: $name"
+}
+
+upload_dynamips(){
+  local f name; f=$(pick_file) || return
+  name="$(basename "$f")"; name="${name// /_}"
+  upload "$f" "$ADDONS/dynamips" "$name" || return
+  fixperms; ok "Dynamips lista: $name"
+}
+
+list_images(){
+  rssh "for t in qemu:$ADDONS/qemu iol:$ADDONS/iol/bin dynamips:$ADDONS/dynamips; do
+          echo; echo \"== \${t%%:*} ==\"; ls -1 \"\${t#*:}\" 2>/dev/null | grep -v '^iourc$' || echo '(vacío)'
+        done; echo; echo '== Disco =='; df -h / | tail -1"
+}
+
+delete_qemu(){
+  local imgs n t c
+  mapfile -t imgs < <(rssh "ls -1 $ADDONS/qemu" 2>/dev/null)
+  (( ${#imgs[@]} )) || { warn "No hay imágenes QEMU"; return; }
+  for i in "${!imgs[@]}"; do printf "  %2d) %s\n" $((i+1)) "${imgs[i]}"; done
+  read -r -p "Número a borrar (Enter cancela): " n
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#imgs[@]} )) || return
+  t="${imgs[n-1]}"
+  read -r -p "¿Borrar ${R}$t${N}? Escribe 'si' para confirmar: " c
+  [[ "$c" == si ]] && rssh "rm -rf '$ADDONS/qemu/$t'" && ok "Borrada: $t"
+}
+
+status(){
+  "${VIRSH[@]}" dominfo "$VM" | grep -E 'State|CPU\(s\)|Max memory|Used memory'
+  echo
+  rssh "echo \"Uptime: \$(uptime -p)\"; free -h | awk '/Mem/{print \"RAM: \"\$3\" usados de \"\$2}';
+        echo \"Virtualización anidada dentro de EVE-NG: \$(grep -cE '(vmx|svm)' /proc/cpuinfo) núcleos con soporte\""
+}
+
+setup_key(){
+  [[ -f "$HOME/.ssh/id_ed25519" ]] || ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+  ssh-copy-id -i "$HOME/.ssh/id_ed25519.pub" "${SSH_OPTS[@]}" "$EVE_USER@$IP" \
+    && ok "Llave copiada: ya no te pedirá contraseña."
+}
+
+open_web(){ xdg-open "http://$IP" &>/dev/null & disown; ok "Abriendo http://$IP"; }
+
+check_nested(){
+  local f
+  for f in /sys/module/kvm_amd/parameters/nested /sys/module/kvm_intel/parameters/nested; do
+    [[ -f "$f" ]] || continue
+    if [[ "$(cat "$f")" =~ ^(1|Y)$ ]]; then ok "Virtualización anidada activa en el host"
+    else warn "Virtualización anidada DESACTIVADA en el host: los nodos irán lentos."; fi
+    return
+  done
+  warn "No encontré el módulo KVM cargado."
+}
+
+# ── Arranque ─────────────────────────────────────────────────
+start_vm(){
+  refresh_sudo
+  if ! "${VIRSH[@]}" dominfo "$VM" &>/dev/null; then
+    err "No existe una VM llamada '$VM'."
+    info "Créala con ./setup.sh (opción 'Crear la VM de EVE-NG') o ajusta VM= en $CONFIG_FILE"
+    exit 1
+  fi
+  if is_running; then
+    ok "La VM '$VM' ya está encendida"
+  else
+    info "Encendiendo '$VM'..."
+    "${VIRSH[@]}" start "$VM" >/dev/null || { err "No se pudo encender la VM"; exit 1; }
+  fi
+  info "Esperando IP..."
+  for _ in {1..60}; do IP=$(get_ip); [[ -n "$IP" ]] && break; sleep 2; done
+  if [[ -z "$IP" ]]; then
+    [[ -n "$FALLBACK_IP" ]] || { err "No pude detectar la IP de la VM. Revisa que EVE-NG use DHCP o define FALLBACK_IP en $CONFIG_FILE"; exit 1; }
+    warn "No detecté la IP, uso $FALLBACK_IP"; IP="$FALLBACK_IP"
+  fi
+  printf "${C}➜${N} Esperando a que EVE-NG arranque en %s " "$IP" >&2
+  for _ in {1..120}; do
+    port_open "$IP" 22 && port_open "$IP" 80 && break
+    printf "." >&2; sleep 2
+  done
+  echo >&2
+  ok "EVE-NG listo en ${BD}http://$IP${N}"
+}
+
+VM_DIED=0
+on_exit(){
+  echo
+  ssh "${SSH_OPTS[@]}" -O exit "$EVE_USER@$IP" &>/dev/null
+  (( VM_DIED )) && return
+  local c
+  read -r -p "¿Apagar la VM '$VM'? [S/n]: " c
+  if [[ ! "$c" =~ ^[nN]$ ]]; then
+    refresh_sudo
+    info "Apagando '$VM'..."
+    "${VIRSH[@]}" shutdown "$VM" >/dev/null
+    for _ in {1..60}; do is_running || break; sleep 2; done
+    is_running && warn "Sigue encendida; puedes forzar con: virsh destroy $VM" || ok "VM apagada"
+  else
+    ok "La VM queda encendida en http://$IP"
+  fi
+}
+
+menu(){
+  clear
+  echo "${M}${BD}  ╭──────────────────────────────────────╮"
+  echo "  │            EVE-NG  Manager            │"
+  echo "  ╰──────────────────────────────────────╯${N}"
+  echo "  ${G}●${N} $VM corriendo en ${BD}http://$IP${N}"
+  echo
+  echo "  1) Subir imagen QEMU  ${D}(qcow2, vmdk, ova, img)${N}"
+  echo "  2) Subir ISO para instalar  ${D}(Linux, Windows...)${N}"
+  echo "  3) Subir imagen IOL  ${D}(.bin)${N}"
+  echo "  4) Subir imagen Dynamips  ${D}(.image)${N}"
+  echo "  5) Ver imágenes instaladas"
+  echo "  6) Borrar imagen QEMU"
+  echo "  7) Estado de la VM"
+  echo "  8) Abrir la web"
+  echo "  9) Abrir consola SSH"
+  echo "  k) Configurar llave SSH (no pedir contraseña)"
+  echo "  0) Salir"
+  echo
+  printf "  Opción: "
+}
+
+main(){
+  check_nested
+  start_vm
+  trap on_exit EXIT
+  trap 'exit 0' INT TERM
+  open_ssh_master || warn "No pude conectar por SSH todavía."
+  open_web
+
+  local op
+  while true; do
+    menu
+    # Espera la opción, revisando cada 5 s que la VM siga encendida
+    while ! read -t 5 -r op; do
+      if ! still_alive; then
+        echo; warn "La VM se apagó. Cerrando."; VM_DIED=1; exit 0
+      fi
+    done
+    echo
+    case "$op" in
+      1) open_ssh_master && upload_qemu;     pause ;;
+      2) open_ssh_master && upload_iso;      pause ;;
+      3) open_ssh_master && upload_iol;      pause ;;
+      4) open_ssh_master && upload_dynamips; pause ;;
+      5) open_ssh_master && list_images;     pause ;;
+      6) open_ssh_master && delete_qemu;     pause ;;
+      7) open_ssh_master && status;          pause ;;
+      8) open_web; sleep 1 ;;
+      9) rssh ;;
+      k|K) setup_key; pause ;;
+      0|q) exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+main "$@"
