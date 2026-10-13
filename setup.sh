@@ -4,12 +4,13 @@
 #  (libvirt) para Arch Linux.
 #
 #  Instala y configura todo lo necesario, crea la VM de EVE-NG
-#  a partir de la ISO que tú descargues e instala el comando 'eve'.
+#  a partir de la ISO que tú descargues e instala los comandos
+#  'eve' (EVE-NG) y 'vms' (máquinas de prueba Linux/Windows/macOS).
 #
 #    ./setup.sh               menú interactivo
 #    ./setup.sh --all         instalación completa sin menú
 #    ./setup.sh --check       solo diagnóstico
-#    ./setup.sh --uninstall   quita el comando 'eve'
+#    ./setup.sh --uninstall   quita los comandos 'eve' y 'vms'
 # ──────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -23,7 +24,8 @@ VM="eve-ng"
 # shellcheck source=/dev/null
 [[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
 
-PKGS=(libvirt virt-install virt-manager virt-viewer dnsmasq openssh rsync xdg-utils)
+# edk2-ovmf = UEFI · swtpm = TPM (Windows 11) · socat = apagar limpio las VMs de quickemu
+PKGS=(libvirt virt-install virt-manager virt-viewer dnsmasq openssh rsync xdg-utils edk2-ovmf swtpm socat)
 
 NEED_RELOGIN=0
 NEED_REBOOT=0
@@ -143,9 +145,12 @@ step_nested(){
 }
 
 step_cli(){
-  title "6. Instalando el comando 'eve'"
+  title "6. Instalando los comandos 'eve' y 'vms'"
   mkdir -p "$BIN_DIR"
-  install -m 755 "$HERE/eve" "$BIN_DIR/eve" && ok "Instalado en $BIN_DIR/eve"
+  local cmd
+  for cmd in eve vms; do
+    install -m 755 "$HERE/$cmd" "$BIN_DIR/$cmd" && ok "Instalado en $BIN_DIR/$cmd"
+  done
   mkdir -p "$CONF_DIR"
   [[ -f "$CONF_FILE" ]] || { cp "$HERE/config.example" "$CONF_FILE"; ok "Configuración creada en $CONF_FILE"; }
   case ":$PATH:" in
@@ -281,6 +286,30 @@ EOF
   info "Si la ventana del primer arranque no aparece, ábrela con: virt-manager"
 }
 
+step_extras(){
+  title "8. Extras para las máquinas de prueba (opcional)"
+  info "${BD}quickemu${N}: necesario para macOS y para bajar ISOs de Linux/Windows solas."
+  info "${BD}virtio-win${N}: drivers de Windows (mejor resolución y copiar/pegar)."
+  local p helper="" repo=() aur=()
+  for p in quickemu virtio-win; do
+    if pacman -Qq "$p" &>/dev/null; then ok "$p ya está instalado"
+    elif pacman -Si "$p" &>/dev/null; then repo+=("$p")
+    else aur+=("$p"); fi
+  done
+  if (( ${#repo[@]} )) && ask "¿Instalar ${repo[*]} con pacman?"; then
+    sudo pacman -S --needed "${repo[@]}" && ok "Instalado: ${repo[*]}"
+  fi
+  (( ${#aur[@]} )) || return 0
+  for p in yay paru; do command -v "$p" &>/dev/null && { helper=$p; break; }; done
+  if [[ -z "$helper" ]]; then
+    warn "${aur[*]} está(n) en el AUR y no encontré yay ni paru."
+    info "Instala yay (https://github.com/Jguer/yay) y luego: ${BD}yay -S ${aur[*]}${N}"
+    return 0
+  fi
+  ask "¿Instalar ${aur[*]} desde el AUR con $helper?" || return 0
+  "$helper" -S --needed "${aur[@]}" && ok "Instalado: ${aur[*]}"
+}
+
 step_check(){
   title "Diagnóstico"
   local good=0 bad=0
@@ -294,12 +323,19 @@ step_check(){
   chk "Grupo libvirt en esta sesión"      'id -nG | grep -qw libvirt'                "cierra sesión y vuelve a entrar"
   chk "Red 'default' activa"              'vsh net-info default | grep -qE "Active:\s+yes"' "paso 4"
   chk "Virtualización anidada"            'nested_on'                                "paso 5 y reiniciar"
+  chk "UEFI (edk2-ovmf) instalado"        'pacman -Qq edk2-ovmf'                     "paso 2"
+  chk "TPM (swtpm) instalado"             'pacman -Qq swtpm'                         "paso 2"
   chk "Comando 'eve' instalado"           '[[ -x "$BIN_DIR/eve" ]]'                  "paso 6"
+  chk "Comando 'vms' instalado"           '[[ -x "$BIN_DIR/vms" ]]'                  "paso 6"
   chk "Comando 'eve' en el PATH"          'command -v eve'                           "abre una terminal nueva"
   chk "VM '$VM' existe"                   'vsh dominfo "$VM"'                        "paso 7"
   chk "VM usa host-passthrough"           'vsh dumpxml "$VM" | grep -q host-passthrough' "paso 7"
+  local p
+  for p in quickemu virtio-win; do
+    pacman -Qq "$p" &>/dev/null && ok "$p ${D}(opcional)${N}" || info "$p no instalado ${D}(opcional, paso 8)${N}"
+  done
   echo
-  if (( bad == 0 )); then ok "${BD}Todo listo.${N} Ejecuta: ${G}eve${N}"
+  if (( bad == 0 )); then ok "${BD}Todo listo.${N} Ejecuta: ${G}eve${N} o ${G}vms${N}"
   else warn "$good bien, $bad por revisar."; fi
 }
 
@@ -308,6 +344,7 @@ summary(){
   (( NEED_REBOOT ))  && warn "${BD}Reinicia la PC${N} para activar la virtualización anidada."
   (( NEED_RELOGIN && ! NEED_REBOOT )) && warn "${BD}Cierra sesión y vuelve a entrar${N} para que se aplique el grupo libvirt."
   ok "Cuando quieras practicar, solo ejecuta: ${G}${BD}eve${N}"
+  ok "Para tus máquinas de prueba (Linux, Windows, macOS): ${G}${BD}vms${N}"
   info "La web de EVE-NG usa por defecto ${BD}admin / eve${N}. Al entrar elige consola ${BD}HTML5${N}, así no necesitas instalar nada más."
 }
 
@@ -319,12 +356,14 @@ full_install(){
   step_nested
   step_cli
   step_vm
+  step_extras
   summary
 }
 
 uninstall(){
   rm -f "$BIN_DIR/eve" && ok "Eliminado $BIN_DIR/eve"
-  info "Tu configuración sigue en $CONF_DIR y la VM no se tocó."
+  rm -f "$BIN_DIR/vms" && ok "Eliminado $BIN_DIR/vms"
+  info "Tu configuración sigue en $CONF_DIR y ninguna VM se tocó."
   info "Para borrar la VM: virsh -c $CONN undefine $VM --remove-all-storage"
 }
 
@@ -342,11 +381,12 @@ menu(){
     echo "  3) Activar servicio libvirt y permisos"
     echo "  4) Configurar red virtual"
     echo "  5) Activar virtualización anidada"
-    echo "  6) Instalar el comando 'eve'"
+    echo "  6) Instalar los comandos 'eve' y 'vms'"
     echo "  7) Crear la VM de EVE-NG desde la ISO"
+    echo "  8) Extras para máquinas de prueba  ${D}(quickemu para macOS, drivers de Windows)${N}"
     echo
     echo "  d) Diagnóstico  ${D}(revisa que todo esté bien)${N}"
-    echo "  u) Desinstalar el comando 'eve'"
+    echo "  u) Desinstalar los comandos 'eve' y 'vms'"
     echo "  0) Salir"
     echo
     read -r -p "  Opción: " op
@@ -358,6 +398,7 @@ menu(){
       5) step_nested; summary; pause ;;
       6) step_cli; pause ;;
       7) step_cpu && step_vm; pause ;;
+      8) step_extras; pause ;;
       d|D) step_check; pause ;;
       u|U) uninstall; pause ;;
       0|q) exit 0 ;;

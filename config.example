@@ -12,3 +12,10 @@
 
 # IP a usar si no se detecta automáticamente
 #FALLBACK_IP="192.168.122.98"   # solo si la IP no se detecta sola
+
+# ── Máquinas de prueba (comando vms) ──
+# Carpeta para descargas de quickget y máquinas macOS (quickemu)
+#VMS_DIR="$HOME/VMs"
+
+# 1 = mostrar también la VM de EVE-NG en la lista de vms
+#VMS_SHOW_EVE=0

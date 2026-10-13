@@ -1,0 +1,775 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+#  vms — Máquinas virtuales de prueba (Linux, Windows y macOS)
+#  Enciende una o varias a la vez, créalas desde una ISO, clónalas
+#  al instante y guarda puntos de restauración para tus pruebas.
+#
+#    vms                    menú interactivo
+#    vms list               lista las máquinas
+#    vms start NOMBRE...    enciende y abre una o varias
+#    vms stop NOMBRE...     apaga una o varias
+#    vms new                asistente para crear una máquina
+# ──────────────────────────────────────────────────────────────
+set -uo pipefail
+
+# ── Configuración (se cambia en el archivo de config) ────────
+VM="eve-ng"                       # VM de EVE-NG: no aparece en la lista
+CONN="qemu:///system"
+VMS_DIR="$HOME/VMs"               # descargas de quickget y máquinas macOS
+VMS_SHOW_EVE=0                    # 1 = mostrar también la VM de EVE-NG
+IMG_DIR="/var/lib/libvirt/images"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/eve-ng-manager/config"
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+BASES_DIR="$IMG_DIR/bases"        # discos base de los clones enlazados
+
+# ── Colores y mensajes ───────────────────────────────────────
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; M=$'\e[35m'; C=$'\e[36m'
+D=$'\e[2m'; BD=$'\e[1m'; N=$'\e[0m'
+info(){ echo "${C}➜${N} $*" >&2; }
+ok()  { echo "${G}✔${N} $*" >&2; }
+warn(){ echo "${Y}⚠${N} $*" >&2; }
+err() { echo "${R}✘${N} $*" >&2; }
+pause(){ read -r -p "${D}Enter para volver al menú...${N}" _; }
+ask()   { local c; read -r -p "$1 [S/n]: " c; [[ ! "$c" =~ ^[nN]$ ]]; }
+ask_no(){ local c; read -r -p "$1 [s/N]: " c; [[ "$c" =~ ^[sS]$ ]]; }
+ask_val(){ local v; read -r -p "$1 [$2]: " v; echo "${v:-$2}"; }
+need(){ command -v "$1" &>/dev/null || { err "Falta '$1'. Instálalo con: ${BD}$2${N}"; return 1; }; }
+
+host_ram_mb(){ awk '/MemTotal/{print int($2/1024)}' /proc/meminfo; }
+avail_ram_mb(){ awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
+fmt_mb(){ awk -v m="$1" 'BEGIN{s=sprintf("%.1f", m/1024); sub(/\.0$/,"",s); print s"G"}'; }
+
+# ── virsh (con sudo solo si hace falta) ──────────────────────
+PRE=()
+if ! env LC_ALL=C virsh -c "$CONN" list &>/dev/null; then
+  command -v virsh &>/dev/null || { err "No encontré virsh. Corre primero ./setup.sh"; exit 1; }
+  warn "Tu usuario no está en el grupo 'libvirt', usaré sudo."
+  sudo -v || exit 1
+  PRE=(sudo)
+fi
+VIRSH=("${PRE[@]}" env LC_ALL=C virsh -c "$CONN")
+"${VIRSH[@]}" list &>/dev/null || { err "No puedo conectar con libvirt. Revisa: systemctl status libvirtd"; exit 1; }
+
+qimg(){ sudo qemu-img "$@"; }   # los discos de libvirt son de root
+
+# ── Datos de cada máquina ────────────────────────────────────
+# Dos tipos: 'lv' (libvirt: Linux y Windows) y 'qe' (quickemu: macOS)
+ENT_KIND=(); ENT_NAME=(); ENT_REF=()
+load_vms(){
+  ENT_KIND=(); ENT_NAME=(); ENT_REF=()
+  local n c
+  while read -r n; do
+    [[ -z "$n" ]] && continue
+    [[ "$n" == "$VM" && "$VMS_SHOW_EVE" != 1 ]] && continue
+    ENT_KIND+=(lv); ENT_NAME+=("$n"); ENT_REF+=("")
+  done < <("${VIRSH[@]}" list --all --name 2>/dev/null | sort)
+  for c in "$VMS_DIR"/*.conf; do
+    [[ -f "$c" ]] && grep -q '^guest_os=' "$c" || continue
+    ENT_KIND+=(qe); ENT_NAME+=("$(basename "$c" .conf)"); ENT_REF+=("$c")
+  done
+}
+
+lv_state(){ "${VIRSH[@]}" domstate "$1" 2>/dev/null | head -1; }
+lv_ip(){ "${VIRSH[@]}" domifaddr "$1" 2>/dev/null | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}'; }
+lv_disks(){ # "target ruta" de cada disco (sin CD-ROM)
+  "${VIRSH[@]}" domblklist "$1" --details 2>/dev/null \
+    | awk '$2=="disk" && $4!="-" {t=$3; $1=$2=$3=""; sub(/^ +/,""); print t" "$0}'
+}
+lv_nvram(){ "${VIRSH[@]}" dumpxml "$1" 2>/dev/null | sed -n 's|.*<nvram[^>]*>\([^<]*\)</nvram>.*|\1|p' | head -1; }
+lv_uuid(){ "${VIRSH[@]}" domuuid "$1" 2>/dev/null | head -1; }
+os_label(){
+  case "$1" in
+    *microsoft.com*|windows*) echo Windows ;;
+    *apple.com*|macos*)       echo macOS ;;
+    "")                       echo "-" ;;
+    *)                        echo Linux ;;
+  esac
+}
+
+conf_get(){ sed -n "s/^$2=\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | head -1; }
+conf_set(){
+  if grep -q "^$2=" "$1"; then sed -i "s|^$2=.*|$2=\"$3\"|" "$1"; else echo "$2=\"$3\"" >> "$1"; fi
+}
+qe_dir(){ echo "${1%.conf}"; }
+qe_pid(){ local d; d=$(qe_dir "$1"); cat "$d/$(basename "$d").pid" 2>/dev/null; }
+qe_on(){ local p; p=$(qe_pid "$1"); [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; }
+
+e_on(){
+  if [[ ${ENT_KIND[$1]} == lv ]]; then [[ "$(lv_state "${ENT_NAME[$1]}")" =~ ^(running|paused)$ ]]
+  else qe_on "${ENT_REF[$1]}"; fi
+}
+e_mem(){ # RAM en MB (vacío si es automática)
+  local v
+  if [[ ${ENT_KIND[$1]} == lv ]]; then
+    "${VIRSH[@]}" dominfo "${ENT_NAME[$1]}" 2>/dev/null | awk '/^Max memory/{print int($3/1024)}'
+  else
+    v=$(conf_get "${ENT_REF[$1]}" ram)
+    if   [[ "$v" =~ ^([0-9]+)G$ ]]; then echo $(( ${BASH_REMATCH[1]} * 1024 ))
+    elif [[ "$v" =~ ^([0-9]+)M$ ]]; then echo "${BASH_REMATCH[1]}"; fi
+  fi
+}
+
+print_list(){
+  load_vms
+  if (( ! ${#ENT_NAME[@]} )); then
+    echo "  ${D}(todavía no tienes máquinas: usa ${N}${BD}n${N}${D} para crear una)${N}"; return
+  fi
+  printf "  ${D}%3s    %-22s %-8s %6s %4s  %s${N}\n" "#" "Nombre" "Sistema" "RAM" "CPU" "Notas"
+  local i n info st mem cpu os dot note c
+  for i in "${!ENT_NAME[@]}"; do
+    n=${ENT_NAME[i]}; note=""
+    if [[ ${ENT_KIND[i]} == lv ]]; then
+      info=$("${VIRSH[@]}" dominfo "$n" 2>/dev/null)
+      st=$(awk -F': +' '/^State/{print $2}' <<<"$info")
+      mem=$(fmt_mb "$(awk '/^Max memory/{print int($3/1024)}' <<<"$info")")
+      cpu=$(awk '/^CPU\(s\)/{print $2}' <<<"$info")
+      os=$(os_label "$("${VIRSH[@]}" dumpxml "$n" 2>/dev/null | grep -o 'os id="[^"]*"' | head -1)")
+      case "$st" in
+        running) dot="${G}●${N}"; note=$(lv_ip "$n"); note=${note:-encendida} ;;
+        paused)  dot="${Y}●${N}"; note="en pausa" ;;
+        *)       dot="${D}○${N}" ;;
+      esac
+      [[ "$n" == "$VM" ]] && note="EVE-NG $note"
+    else
+      c=${ENT_REF[i]}
+      os=$(os_label "$(conf_get "$c" guest_os)")
+      mem=$(conf_get "$c" ram); mem=${mem:-auto}
+      cpu=$(conf_get "$c" cpu_cores); cpu=${cpu:-auto}
+      if qe_on "$c"; then dot="${G}●${N}"; note="encendida (quickemu)"
+      else dot="${D}○${N}"; note="quickemu"; fi
+    fi
+    printf "  %3d %s  %-22s %-8s %6s %4s  ${D}%s${N}\n" $((i+1)) "$dot" "${n:0:22}" "$os" "$mem" "$cpu" "$note"
+  done
+}
+
+# ── Elegir una o varias ──────────────────────────────────────
+PICKS=(); PICK=-1
+parse_sel(){ # parse_sel "1 3-5,a" total → PICKS (índices desde 0)
+  local total=$2 tok a b i toks=()
+  local -A seen=()
+  PICKS=()
+  read -r -a toks <<<"${1//,/ }"
+  for tok in "${toks[@]}"; do
+    if [[ "$tok" == a ]]; then
+      for ((i=1; i<=total; i++)); do seen[$i]=1; done
+    elif [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+      (( a > b )) && { i=$a; a=$b; b=$i; }
+      for ((i=a; i<=b; i++)); do seen[$i]=1; done
+    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+      seen[$((10#$tok))]=1
+    else
+      err "No entiendo '$tok'"; return 1
+    fi
+  done
+  for ((i=1; i<=total; i++)); do [[ -n "${seen[$i]:-}" ]] && PICKS+=($((i-1))); done
+  for i in "${!seen[@]}"; do (( i < 1 || i > total )) && warn "No existe la #$i"; done
+  (( ${#PICKS[@]} ))
+}
+pick_one(){
+  local n; read -r -p "$1 (número, Enter cancela): " n
+  [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= ${#ENT_NAME[@]} )) || return 1
+  PICK=$((10#$n - 1))
+}
+pick_many(){ local s; read -r -p "$1 (ej: 1 3 · 2-4 · a = todas; Enter cancela): " s; [[ -n "$s" ]] && parse_sel "$s" "${#ENT_NAME[@]}"; }
+sel_by_names(){ # para la línea de comandos
+  local want i found
+  load_vms; PICKS=()
+  for want in "$@"; do
+    found=0
+    for i in "${!ENT_NAME[@]}"; do [[ "${ENT_NAME[i]}" == "$want" ]] && { PICKS+=("$i"); found=1; }; done
+    (( found )) || err "No existe la máquina '$want' (mira: vms list)"
+  done
+  (( ${#PICKS[@]} ))
+}
+
+# ── Encender, ver y apagar ───────────────────────────────────
+open_viewer(){
+  need virt-viewer "sudo pacman -S virt-viewer" || return 0
+  if (( ${#PRE[@]} )); then warn "Sin el grupo libvirt no puedo abrir la ventana; usa virt-manager."; return 0; fi
+  virt-viewer --connect "$CONN" --wait --reconnect "$1" &>/dev/null & disown
+}
+
+qe_start(){
+  need quickemu "yay -S quickemu  (o ./setup.sh → opción 8)" || return 1
+  local c=$1 d; d=$(qe_dir "$c"); mkdir -p "$d"
+  ( cd "$(dirname "$c")" && quickemu --vm "$(basename "$c")" ) &>"$d/vms-launch.log" & disown
+}
+qe_stop(){ # qe_stop conf [forzar]
+  local c=$1 force=${2:-0} d n sock
+  d=$(qe_dir "$c"); n=$(basename "$d"); sock="$d/$n-monitor.socket"
+  if (( force )); then
+    ( cd "$(dirname "$c")" && quickemu --vm "$(basename "$c")" --kill ) &>/dev/null; return
+  fi
+  if [[ -S "$sock" ]] && command -v socat &>/dev/null; then
+    echo system_powerdown | socat - "UNIX-CONNECT:$sock" &>/dev/null && return 0
+  fi
+  warn "No puedo pedirle a $n que se apague (falta socat). Apágala desde adentro o usa x para forzar."
+  return 1
+}
+
+start_sel(){
+  local i n m need_mb=0 avail todo=()
+  for i in "$@"; do
+    if e_on "$i"; then
+      n=${ENT_NAME[i]}
+      if [[ ${ENT_KIND[i]} == lv ]]; then
+        [[ "$(lv_state "$n")" == paused ]] && "${VIRSH[@]}" resume "$n" >/dev/null && ok "$n reanudada"
+        ok "$n ya está encendida, abro su ventana"; open_viewer "$n"
+      else
+        ok "$n ya está encendida (su ventana es la de quickemu)"
+      fi
+      continue
+    fi
+    todo+=("$i"); m=$(e_mem "$i"); [[ "$m" =~ ^[0-9]+$ ]] && need_mb=$((need_mb + m))
+  done
+  (( ${#todo[@]} )) || return 0
+
+  avail=$(avail_ram_mb)
+  if (( need_mb > avail )); then
+    warn "Estas máquinas piden ${BD}$(fmt_mb "$need_mb")${N} de RAM y tienes ${BD}$(fmt_mb "$avail")${N} libres."
+    info "Pueden arrancar (solo usan lo que necesitan), pero si se acaba la RAM tu PC se pone lenta."
+    ask_no "¿Encenderlas de todos modos?" || return 0
+  fi
+
+  for i in "${todo[@]}"; do
+    n=${ENT_NAME[i]}
+    if [[ ${ENT_KIND[i]} == lv ]]; then
+      info "Encendiendo $n..."
+      if "${VIRSH[@]}" start "$n" >/dev/null; then ok "$n encendida"; open_viewer "$n"
+      else err "No se pudo encender $n"; fi
+    else
+      qe_start "${ENT_REF[i]}" && ok "Encendiendo $n (quickemu abre su ventana)"
+    fi
+  done
+}
+
+stop_sel(){ # stop_sel forzar índices...
+  local force=$1 i n; shift
+  for i in "$@"; do
+    n=${ENT_NAME[i]}
+    e_on "$i" || { info "$n ya estaba apagada"; continue; }
+    if [[ ${ENT_KIND[i]} == lv ]]; then
+      if (( force )); then "${VIRSH[@]}" destroy "$n" >/dev/null && ok "$n apagada a la fuerza"
+      else "${VIRSH[@]}" shutdown "$n" >/dev/null && ok "Le pedí a $n que se apague (puede tardar un poco)"; fi
+    else
+      qe_stop "${ENT_REF[i]}" "$force" && ok "$n apagándose"
+    fi
+  done
+}
+
+view_one(){
+  pick_one "¿Cuál quieres ver?" || return
+  local n=${ENT_NAME[PICK]}
+  e_on "$PICK" || { warn "$n está apagada; escribe su número en el menú para encenderla."; return; }
+  if [[ ${ENT_KIND[PICK]} == lv ]]; then open_viewer "$n"; ok "Abriendo la ventana de $n"
+  else info "Las máquinas de quickemu usan su propia ventana; si la cerraste, se apagó."; fi
+}
+
+# ── ISOs ─────────────────────────────────────────────────────
+has_qg(){ command -v quickget &>/dev/null; }
+find_isos(){ # ISOs locales, sin la de EVE-NG ni la de drivers
+  {
+    find "$VMS_DIR" -maxdepth 3 -iname '*.iso' 2>/dev/null
+    find "$HOME/Descargas" "$HOME/Downloads" "$HOME/ISOs" "$HOME/isos" -maxdepth 2 -iname '*.iso' 2>/dev/null
+    find "$IMG_DIR" -maxdepth 1 -iname '*.iso' 2>/dev/null
+  } | grep -viE '/(eve[-_][^/]*|[^/]*virtio-win[^/]*|unattended[^/]*)\.iso$' | sort -u
+}
+find_virtio_win(){
+  local f
+  for f in /usr/share/virtio/virtio-win.iso "$IMG_DIR/virtio-win.iso"; do [[ -f "$f" ]] && { echo "$f"; return; }; done
+  find "$VMS_DIR" "$HOME/Descargas" "$HOME/Downloads" -maxdepth 3 -iname 'virtio-win*.iso' 2>/dev/null | head -1
+}
+clean_path(){ # quita lo que agrega arrastrar un archivo a la terminal
+  local f=$1
+  f="${f#file://}"; f="${f//%20/ }"; f="${f//\\ / }"; f="${f//\'/}"; f="${f//\"/}"
+  f="${f%"${f##*[![:space:]]}"}"; f="${f#"${f%%[![:space:]]*}"}"; f="${f/#\~/$HOME}"
+  echo "$f"
+}
+
+qg_iso(){ # descarga con quickget e imprime la ruta de la ISO
+  local args=() dirs=() d iso
+  mkdir -p "$VMS_DIR"
+  if [[ $1 == windows ]]; then
+    args=(windows "$2")
+    info "Se descarga directo de Microsoft (unos 6 GB). A veces Microsoft bloquea la descarga; si falla, bájala a mano."
+  else
+    echo "Ejemplos: ${D}ubuntu 24.04 · fedora 41 Workstation · debian 12.8.0 · linuxmint 22 cinnamon · archlinux latest${N}" >&2
+    read -r -p "Distro y versión (solo la distro = ver versiones): " -a args
+    (( ${#args[@]} )) || return 1
+    if (( ${#args[@]} == 1 )); then
+      ( cd "$VMS_DIR" && quickget "${args[0]}" ) >&2
+      read -r -p "Distro y versión: " -a args
+      (( ${#args[@]} >= 2 )) || return 1
+    fi
+  fi
+  info "Descargando con quickget en $VMS_DIR..."
+  ( cd "$VMS_DIR" && quickget "${args[@]}" ) >&2 || { err "quickget falló"; return 1; }
+  mapfile -t dirs < <(ls -1dt "$VMS_DIR/${args[0]}-${args[1]}"*/ 2>/dev/null)
+  d="${dirs[0]:-}"; d="${d%/}"
+  [[ -d "$d" ]] || { err "No encontré lo que descargó quickget en $VMS_DIR"; return 1; }
+  iso=$(find "$d" -maxdepth 1 -iname '*.iso' ! -iname '*virtio*' ! -iname 'unattended*' | head -1)
+  [[ -n "$iso" ]] || { err "quickget no bajó una ISO para esto (revisa $d)"; return 1; }
+  # quickget también crea un .conf de quickemu; si no se usó, lo quito para no ensuciar la lista
+  [[ -f "$d.conf" && ! -e "$d/disk.qcow2" ]] && rm -f "$d.conf"
+  echo "$iso"
+}
+
+choose_iso(){ # choose_iso linux|windows [versión] → imprime la ruta
+  local isos=() i c f
+  mapfile -t isos < <(find_isos)
+  echo "${BD}¿Qué ISO uso?${N}" >&2
+  for i in "${!isos[@]}"; do
+    printf "  %2d) %s ${D}(%s · %s)${N}\n" $((i+1)) "$(basename "${isos[i]}")" \
+      "$(du -h "${isos[i]}" 2>/dev/null | cut -f1)" "$(dirname "${isos[i]}")" >&2
+  done
+  has_qg && echo "   d) Descargarla automáticamente ${D}(quickget)${N}" >&2
+  echo "   o) Escribir otra ruta" >&2
+  read -r -p "> " c
+  if [[ "$c" =~ ^[0-9]+$ ]] && (( 10#$c >= 1 && 10#$c <= ${#isos[@]} )); then echo "${isos[10#$c-1]}"; return; fi
+  if [[ "$c" == d ]] && has_qg; then qg_iso "$@"; return; fi
+  read -e -r -p "Ruta de la ISO (Tab autocompleta, o arrástrala aquí): " f
+  f=$(clean_path "$f")
+  [[ -f "$f" ]] || { err "No existe: $f"; return 1; }
+  echo "$f"
+}
+
+stage_iso(){ # libvirt no puede leer tu carpeta personal: copio la ISO una sola vez
+  local src=$1 dst
+  [[ "$src" == "$IMG_DIR/"* || "$src" == /usr/share/* ]] && { echo "$src"; return; }
+  dst="$IMG_DIR/$(basename "$src")"
+  if sudo test -f "$dst" && [[ "$(sudo stat -c %s "$dst")" == "$(stat -c %s "$src")" ]]; then
+    info "$(basename "$src") ya estaba en $IMG_DIR, la reutilizo"
+  else
+    info "Copiando $(basename "$src") a $IMG_DIR..."
+    sudo cp "$src" "$dst" || { err "No se pudo copiar la ISO"; return 1; }
+  fi
+  echo "$dst"
+}
+
+# ── Crear máquinas ───────────────────────────────────────────
+NAME=""; RAM=0; CPU=0; DISK=0
+name_from(){ basename "$1" | sed -E 's/\.iso$//I; s/[^A-Za-z0-9._-]+/-/g' | cut -d- -f1-2 | tr '[:upper:]' '[:lower:]'; }
+exists(){ "${VIRSH[@]}" dominfo "$1" &>/dev/null || [[ -e "$VMS_DIR/$1.conf" ]]; }
+ask_name(){
+  local base=$1 n i=2
+  n=$base; while exists "$n"; do n="$base-$i"; ((i++)); done
+  NAME=$(ask_val "Nombre de la máquina" "$n")
+  [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { err "Usa solo letras, números, punto, guion y guion bajo."; return 1; }
+  exists "$NAME" && { err "Ya existe una máquina llamada '$NAME'"; return 1; }
+  return 0
+}
+ask_resources(){ # ask_resources ram_gb cpus disco_gb|-
+  local tot cores sr sc
+  tot=$(( $(host_ram_mb) / 1024 )); cores=$(nproc)
+  sr=$1; (( sr > tot/2 )) && sr=$(( tot/2 )); (( sr < 2 )) && sr=2
+  sc=$2; (( sc > cores/2 )) && sc=$(( cores/2 )); (( sc < 1 )) && sc=1
+  info "Tu PC tiene ${BD}${tot} GB${N} de RAM y ${BD}${cores}${N} hilos."
+  RAM=$(ask_val "RAM en GB" "$sr")
+  CPU=$(ask_val "Núcleos de CPU" "$sc")
+  DISK=0; [[ "$3" != - ]] && DISK=$(ask_val "Disco en GB (dinámico: solo ocupa lo que uses)" "$3")
+  [[ "$RAM$CPU$DISK" =~ ^[0-9]+$ ]] || { err "Solo números, por favor."; return 1; }
+  (( RAM >= 1 && CPU >= 1 )) || { err "Mínimo 1 GB y 1 núcleo."; return 1; }
+  (( RAM >= tot )) && { err "No le puedes dar toda tu RAM."; return 1; }
+  (( CPU > cores )) && warn "Le das más núcleos de los que tienes; funciona, pero no conviene."
+  return 0
+}
+have_osinfo(){ osinfo-query os "short-id=$1" 2>/dev/null | grep -qw "$1"; }
+
+install_vm(){ # install_vm NOMBRE args-de-virt-install...
+  local n=$1; shift
+  need virt-install "sudo pacman -S virt-install" || return 1
+  open_viewer "$n"
+  info "Creando '$n'..."
+  if "${PRE[@]}" virt-install --connect "$CONN" --name "$n" "$@" --noautoconsole >/dev/null; then
+    ok "${BD}$n${N} creada y arrancando desde la ISO"
+  else
+    err "virt-install falló (arriba está el motivo)"; return 1
+  fi
+}
+
+new_linux(){
+  local iso osi
+  iso=$(choose_iso linux) || return
+  ask_name "$(name_from "$iso")" || return
+  ask_resources 4 2 30 || return
+  echo; info "Resumen: ${BD}$NAME${N} · Linux · ${RAM} GB RAM · ${CPU} CPU · disco ${DISK} GB · UEFI"
+  ask "¿Crearla?" || return
+  iso=$(stage_iso "$iso") || return
+  osi="detect=on,require=off"
+  have_osinfo linux2022 && osi="detect=on,name=linux2022"
+  install_vm "$NAME" \
+    --memory $((RAM * 1024)) --vcpus "$CPU" --cpu host-passthrough \
+    --osinfo "$osi" --boot uefi \
+    --disk "path=$IMG_DIR/$NAME.qcow2,size=$DISK,format=qcow2,bus=virtio" \
+    --cdrom "$iso" \
+    --network network=default,model=virtio \
+    --graphics spice --video virtio || return
+  info "Instala la distro normal. Al terminar, la máquina arranca sola desde el disco."
+  info "Tip: instala ${BD}spice-vdagent${N} adentro para copiar/pegar y ajustar la resolución."
+}
+
+new_windows(){
+  local ver iso vw osi boot extra=()
+  ver=$(ask_val "¿Windows 10 u 11?" 11)
+  [[ "$ver" == 10 || "$ver" == 11 ]] || { err "Escribe 10 u 11"; return; }
+  iso=$(choose_iso windows "$ver") || return
+  ask_name "win$ver" || return
+  ask_resources 8 4 80 || return
+  (( RAM < 4 ))   && warn "Windows $ver pide mínimo 4 GB de RAM."
+  (( DISK < 64 )) && [[ $ver == 11 ]] && warn "Windows 11 pide mínimo 64 GB de disco; el instalador puede negarse."
+  vw=$(find_virtio_win)
+  echo; info "Resumen: ${BD}$NAME${N} · Windows $ver · ${RAM} GB RAM · ${CPU} CPU · disco ${DISK} GB"
+  [[ $ver == 11 ]] && info "Incluye UEFI con Secure Boot y TPM 2.0 (lo que pide Windows 11)."
+  if [[ -n "$vw" ]]; then info "Agrego los drivers virtio-win como segundo CD."
+  else info "${D}No encontré virtio-win.iso (opcional: mejora resolución y copiar/pegar; ver setup.sh opción 8).${N}"; fi
+  ask "¿Crearla?" || return
+  iso=$(stage_iso "$iso") || return
+  if [[ -n "$vw" ]]; then vw=$(stage_iso "$vw") && extra+=(--disk "path=$vw,device=cdrom,bus=sata"); fi
+  osi="win$ver"; have_osinfo "$osi" || osi="detect=on,require=off"
+  if [[ $ver == 11 ]]; then
+    boot="firmware=efi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=yes,firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=yes"
+    extra+=(--features smm.state=on --tpm "backend.type=emulator,backend.version=2.0,model=tpm-crb")
+  else
+    boot="uefi"
+  fi
+  # Disco SATA y red e1000e: el instalador de Windows los ve sin drivers extra
+  install_vm "$NAME" \
+    --memory $((RAM * 1024)) --vcpus "$CPU" --cpu host-passthrough \
+    --osinfo "$osi" --boot "$boot" \
+    --disk "path=$IMG_DIR/$NAME.qcow2,size=$DISK,format=qcow2,bus=sata" \
+    --cdrom "$iso" \
+    --network network=default,model=e1000e \
+    --graphics spice --video qxl "${extra[@]}" || return
+  echo
+  warn "${BD}Fíjate en la ventana:${N} cuando diga ${BD}\"Press any key to boot from CD\"${N} presiona una tecla rápido."
+  info "Si se te pasa, reinicia la máquina con: ${BD}virsh -c $CONN reset $NAME${N}"
+  [[ -n "$vw" ]] && info "Ya instalado, abre el CD de virtio-win y corre ${BD}virtio-win-guest-tools.exe${N}."
+}
+
+new_macos(){
+  local rels=(sequoia sonoma ventura monterey big-sur) i c rel conf
+  if ! has_qg || ! command -v quickemu &>/dev/null; then
+    warn "Para macOS uso ${BD}quickemu${N}, que se encarga de OpenCore y de bajar macOS desde Apple."
+    info "Instálalo con ${BD}./setup.sh${N} → opción 8, o: ${BD}yay -S quickemu${N}"
+    return
+  fi
+  echo "${D}Ojo: la licencia de Apple solo permite macOS en hardware Apple. Úsalo bajo tu responsabilidad.${N}" >&2
+  grep -qw svm /proc/cpuinfo && warn "Tienes CPU AMD: macOS puede ir más lento o fallar en algunas versiones. Si se traba, prueba otra."
+  echo "${BD}¿Qué versión?${N}" >&2
+  for i in "${!rels[@]}"; do printf "  %d) %s\n" $((i+1)) "${rels[i]}" >&2; done
+  read -r -p "> [2]: " c; c=${c:-2}
+  [[ "$c" =~ ^[0-9]+$ ]] && (( 10#$c >= 1 && 10#$c <= ${#rels[@]} )) || { err "Opción inválida"; return; }
+  rel=${rels[10#$c-1]}; conf="$VMS_DIR/macos-$rel.conf"
+  if [[ -f "$conf" ]]; then
+    warn "Ya tienes macos-$rel en $VMS_DIR."
+    ask "¿Encenderla?" && qe_start "$conf" && ok "Encendiendo macos-$rel"
+    return
+  fi
+  ask_resources 8 4 - || return
+  mkdir -p "$VMS_DIR"
+  info "Bajando la imagen de recuperación de macOS $rel desde Apple..."
+  ( cd "$VMS_DIR" && quickget macos "$rel" ) >&2 || { err "quickget falló"; return; }
+  [[ -f "$conf" ]] || { err "No se creó $conf"; return; }
+  conf_set "$conf" ram "${RAM}G"
+  conf_set "$conf" cpu_cores "$CPU"
+  ok "macos-$rel lista en $VMS_DIR"
+  cat >&2 <<EOF
+
+${BD}Para instalar:${N}
+  1. En el menú de OpenCore elige ${BD}macOS Base System${N}.
+  2. Abre ${BD}Utilidad de Discos${N} → ver todos los dispositivos → borra el disco grande como ${BD}APFS${N}.
+  3. Cierra y elige ${BD}Reinstalar macOS${N}. Se baja de Apple, tarda un buen rato y reinicia varias veces.
+
+EOF
+  ask "¿Encenderla ya?" && qe_start "$conf" && ok "Encendiendo macos-$rel"
+}
+
+new_vm(){
+  echo "${BD}¿Qué sistema quieres?${N}"
+  echo "  1) Linux   ${D}(cualquier distro)${N}"
+  echo "  2) Windows ${D}(10 u 11)${N}"
+  echo "  3) macOS   ${D}(con quickemu)${N}"
+  local c; read -r -p "> " c
+  case "$c" in
+    1) new_linux ;;
+    2) new_windows ;;
+    3) new_macos ;;
+    *) ;;
+  esac
+}
+
+# ── Clonar (enlazado = instantáneo) ──────────────────────────
+has_snaps(){ [[ -n "$(qimg snapshot -l "$1" 2>/dev/null)" ]]; }
+is_qcow2(){ qimg info -U "$1" 2>/dev/null | grep -q '^file format: qcow2'; }
+backing_of(){ qimg info -U --output=json "$1" 2>/dev/null | sed -n 's/.*"full-backing-filename": "\([^"]*\)".*/\1/p' | head -1; }
+
+clone_vm(){
+  pick_one "¿Qué máquina clonar?" || return
+  local src=${ENT_NAME[PICK]} mode disks=() line t p base newp files=() done_moves=() ok_all=1 ts
+  if [[ ${ENT_KIND[PICK]} != lv ]]; then
+    info "Las de quickemu se clonan copiando su carpeta y su .conf en $VMS_DIR (con la máquina apagada)."; return
+  fi
+  e_on "$PICK" && { err "Apaga $src primero"; return; }
+  ask_name "$src-clon" || return
+  echo "  1) Rápido ${D}(enlazado: instantáneo y casi no ocupa disco)${N}"
+  echo "  2) Completo ${D}(copia todo el disco, independiente)${N}"
+  mode=$(ask_val "Tipo de clon" 1)
+  mapfile -t disks < <(lv_disks "$src")
+  (( ${#disks[@]} )) || { err "$src no tiene discos"; return; }
+
+  if [[ "$mode" == 1 ]]; then
+    for line in "${disks[@]}"; do
+      p=${line#* }
+      is_qcow2 "$p" || { warn "$p no es qcow2; hago clon completo."; mode=2; break; }
+      if has_snaps "$p"; then
+        warn "$src tiene puntos de restauración; con un clon enlazado quedarían congelados. Hago clon completo."
+        mode=2; break
+      fi
+    done
+  fi
+
+  if [[ "$mode" == 1 ]]; then
+    # Truco: el disco actual se vuelve una base de solo lectura y tanto la
+    # original como el clon escriben en una capa nueva encima. Así ninguna
+    # de las dos puede dañar a la otra.
+    sudo mkdir -p "$BASES_DIR"; ts=$(date +%Y%m%d-%H%M%S)
+    for line in "${disks[@]}"; do
+      t=${line%% *}; p=${line#* }
+      base="$BASES_DIR/$src-$t-$ts.qcow2"
+      if [[ ${#files[@]} -eq 0 ]]; then newp="$IMG_DIR/$NAME.qcow2"; else newp="$IMG_DIR/$NAME-$t.qcow2"; fi
+      if sudo mv "$p" "$base" && qimg create -q -f qcow2 -b "$base" -F qcow2 "$p"; then
+        done_moves+=("$base|$p")
+        sudo chmod 0444 "$base"
+        qimg create -q -f qcow2 -b "$base" -F qcow2 "$newp" || { ok_all=0; break; }
+        files+=(--file "$newp")
+      else
+        [[ -f "$base" && ! -f "$p" ]] && sudo mv "$base" "$p"
+        ok_all=0; break
+      fi
+    done
+    if (( ok_all )) && "${PRE[@]}" virt-clone --connect "$CONN" --original "$src" --name "$NAME" "${files[@]}" --preserve-data >/dev/null; then
+      copy_uefi_tpm "$src" "$NAME"
+      ok "Clon enlazado ${BD}$NAME${N} listo"
+    else
+      err "Falló el clon; dejo $src como estaba."
+      for line in "${done_moves[@]}"; do
+        base=${line%%|*}; p=${line#*|}
+        sudo rm -f "$p" && sudo chmod 0644 "$base" && sudo mv "$base" "$p"
+      done
+      for ((t=1; t<${#files[@]}; t+=2)); do sudo rm -f "${files[t]}"; done
+      return
+    fi
+  else
+    info "Copiando discos (puede tardar)..."
+    "${PRE[@]}" virt-clone --connect "$CONN" --original "$src" --name "$NAME" --auto-clone >/dev/null \
+      || { err "virt-clone falló"; return; }
+    copy_uefi_tpm "$src" "$NAME"
+    ok "Clon completo ${BD}$NAME${N} listo"
+  fi
+  info "Tip: en clones de Linux corre ${BD}sudo rm /etc/machine-id && sudo systemd-machine-id-setup${N} para que no peleen por la misma IP."
+}
+copy_uefi_tpm(){ # copia la NVRAM (entradas de arranque UEFI) y el TPM al clon si no los tiene
+  local a b ua ub
+  a=$(lv_nvram "$1"); b=$(lv_nvram "$2")
+  if [[ -n "$a" && -n "$b" && "$a" != "$b" ]] && sudo test -f "$a" && ! sudo test -f "$b"; then
+    sudo cp -a "$a" "$b"
+  fi
+  ua=$(lv_uuid "$1"); ub=$(lv_uuid "$2")
+  if [[ -n "$ua" && -n "$ub" ]] && sudo test -d "/var/lib/libvirt/swtpm/$ua" && ! sudo test -e "/var/lib/libvirt/swtpm/$ub"; then
+    sudo cp -a "/var/lib/libvirt/swtpm/$ua" "/var/lib/libvirt/swtpm/$ub"
+  fi
+}
+
+# ── Puntos de restauración ───────────────────────────────────
+snap_menu(){
+  pick_one "¿De qué máquina?" || return
+  local i=$PICK n=${ENT_NAME[PICK]} paths=() line p act num tag tags=() run=()
+  e_on "$i" && { err "Apaga $n primero (los puntos se toman con la máquina apagada)."; return; }
+  if [[ ${ENT_KIND[i]} == lv ]]; then
+    run=(sudo qemu-img)
+    while read -r line; do [[ -n "$line" ]] && paths+=("${line#* }"); done < <(lv_disks "$n")
+  else
+    run=(qemu-img)
+    p=$(conf_get "${ENT_REF[i]}" disk_img)
+    [[ "$p" == /* ]] || p="$(dirname "${ENT_REF[i]}")/$p"
+    paths=("$p")
+  fi
+  (( ${#paths[@]} )) || { err "No encontré discos de $n"; return; }
+  for p in "${paths[@]}"; do
+    "${run[@]}" info "$p" 2>/dev/null | grep -q '^file format: qcow2' || { err "$p no es qcow2"; return; }
+  done
+  mapfile -t tags < <("${run[@]}" snapshot -l "${paths[0]}" 2>/dev/null | awk 'NR>2{print $2}')
+
+  echo "${BD}Puntos de restauración de $n:${N}"
+  if (( ${#tags[@]} )); then
+    "${run[@]}" snapshot -l "${paths[0]}" | awk 'NR>2{printf "  %d) %-28s %s %s\n", NR-2, $2, $(NF-3), substr($(NF-2),1,5)}'
+  else
+    echo "  ${D}(ninguno)${N}"
+  fi
+  echo
+  echo "  1) Crear uno ahora   2) Volver a uno   3) Borrar uno"
+  read -r -p "> " act
+  case "$act" in
+    1)
+      tag=$(ask_val "Nombre" "$(date +%Y-%m-%d_%H%M)"); tag=${tag// /_}
+      for p in "${paths[@]}"; do "${run[@]}" snapshot -c "$tag" "$p" || { err "Falló en $p"; return; }; done
+      ok "Punto '${BD}$tag${N}' guardado"
+      return ;;
+    2|3) ;;
+    *) return ;;
+  esac
+  (( ${#tags[@]} )) || { warn "No hay puntos todavía"; return; }
+  read -r -p "Número del punto: " num
+  [[ "$num" =~ ^[0-9]+$ ]] && (( 10#$num >= 1 && 10#$num <= ${#tags[@]} )) || return
+  tag=${tags[10#$num-1]}
+  if [[ "$act" == 2 ]]; then
+    ask_no "¿Regresar $n a '${BD}$tag${N}'? Se pierde todo lo que hiciste después" || return
+    for p in "${paths[@]}"; do "${run[@]}" snapshot -a "$tag" "$p" || { err "Falló en $p"; return; }; done
+    ok "$n regresó a '$tag'"
+  else
+    ask_no "¿Borrar el punto '$tag'?" || return
+    for p in "${paths[@]}"; do "${run[@]}" snapshot -d "$tag" "$p"; done
+    ok "Punto '$tag' borrado"
+  fi
+}
+
+# ── Cambiar RAM / CPU ────────────────────────────────────────
+edit_vm(){
+  pick_one "¿Qué máquina?" || return
+  local n=${ENT_NAME[PICK]} cur_ram cur_cpu
+  if [[ ${ENT_KIND[PICK]} == lv ]]; then
+    cur_ram=$(( $(e_mem "$PICK") / 1024 ))
+    cur_cpu=$("${VIRSH[@]}" dominfo "$n" | awk '/^CPU\(s\)/{print $2}')
+  else
+    cur_ram=$(conf_get "${ENT_REF[PICK]}" ram); cur_ram=${cur_ram%G}; cur_ram=${cur_ram:-8}
+    cur_cpu=$(conf_get "${ENT_REF[PICK]}" cpu_cores); cur_cpu=${cur_cpu:-4}
+  fi
+  ask_resources "$cur_ram" "$cur_cpu" - || return
+  if [[ ${ENT_KIND[PICK]} == lv ]]; then
+    "${PRE[@]}" virt-xml --connect "$CONN" "$n" --edit --memory "memory=$((RAM*1024)),currentMemory=$((RAM*1024))" >/dev/null \
+      && "${PRE[@]}" virt-xml --connect "$CONN" "$n" --edit --vcpus "$CPU" >/dev/null \
+      || { err "No se pudo cambiar"; return; }
+  else
+    conf_set "${ENT_REF[PICK]}" ram "${RAM}G"; conf_set "${ENT_REF[PICK]}" cpu_cores "$CPU"
+  fi
+  ok "$n: ${RAM} GB RAM · ${CPU} CPU"
+  e_on "$PICK" && info "Se aplica la próxima vez que la enciendas."
+}
+
+# ── Borrar ───────────────────────────────────────────────────
+cleanup_bases(){ # borra discos base que ya ningún clon usa
+  sudo test -d "$BASES_DIR" || return 0
+  local -A used=()
+  local names=() n line f b orphans=()
+  mapfile -t names < <("${VIRSH[@]}" list --all --name 2>/dev/null)
+  for n in "${names[@]}"; do
+    [[ -z "$n" ]] && continue
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      f=${line#* }
+      while b=$(backing_of "$f"); [[ -n "$b" ]]; do used[$b]=1; f=$b; done
+    done < <(lv_disks "$n")
+  done
+  while read -r b; do
+    [[ -n "$b" && -z "${used[$b]:-}" ]] && orphans+=("$b")
+  done < <(sudo find "$BASES_DIR" -maxdepth 1 -name '*.qcow2' 2>/dev/null)
+  (( ${#orphans[@]} )) || return 0
+  info "Estos discos base ya no los usa ninguna máquina:"
+  printf "  %s\n" "${orphans[@]}" >&2
+  ask "¿Borrarlos para liberar espacio?" && sudo rm -f "${orphans[@]}" && ok "Espacio liberado"
+}
+
+delete_vm(){
+  pick_one "¿Qué máquina borrar?" || return
+  local i=$PICK n=${ENT_NAME[PICK]} c targets=() line d st=()
+  echo "${R}${BD}Esto borra $n y sus discos para siempre.${N}"
+  read -r -p "Escribe el nombre para confirmar: " c
+  [[ "$c" == "$n" ]] || { info "Cancelado"; return; }
+  if e_on "$i"; then stop_sel 1 "$i"; sleep 2; fi
+  if [[ ${ENT_KIND[i]} == lv ]]; then
+    while read -r line; do [[ -n "$line" ]] && targets+=("${line%% *}"); done < <(lv_disks "$n")
+    (( ${#targets[@]} )) && st=(--storage "$(IFS=,; echo "${targets[*]}")")
+    # Solo borra los discos de la máquina; las ISOs compartidas no se tocan
+    "${VIRSH[@]}" undefine "$n" --nvram --tpm "${st[@]}" &>/dev/null \
+      || "${VIRSH[@]}" undefine "$n" --nvram "${st[@]}" >/dev/null \
+      || { err "No se pudo borrar $n"; return; }
+    ok "$n borrada"
+    cleanup_bases
+  else
+    d=$(qe_dir "${ENT_REF[i]}")
+    [[ "$d" == "$VMS_DIR/"?* ]] || { err "Ruta rara, no borro nada: $d"; return; }
+    rm -rf -- "$d" "${ENT_REF[i]}" && ok "$n borrada"
+  fi
+}
+
+# ── Menú ─────────────────────────────────────────────────────
+menu(){
+  clear
+  echo "${M}${BD}  ╭──────────────────────────────────────╮"
+  echo "  │        Máquinas de prueba · vms       │"
+  echo "  ╰──────────────────────────────────────╯${N}"
+  echo
+  print_list
+  echo
+  echo "  ${D}RAM libre: $(fmt_mb "$(avail_ram_mb)") de $(fmt_mb "$(host_ram_mb)")${N}"
+  echo
+  echo "  ${BD}Escribe números para encender y abrir${N}  ${D}(2 · 1 3 · 1-4 · a = todas)${N}"
+  echo
+  echo "  n) Nueva máquina ${D}(Linux, Windows, macOS)${N}"
+  echo "  v) Ver pantalla       p) Apagar        x) Forzar apagado"
+  echo "  c) Clonar             s) Puntos de restauración"
+  echo "  e) Cambiar RAM/CPU    b) Borrar        r) Recargar"
+  echo "  0) Salir"
+  echo
+  printf "  > "
+}
+
+interactive(){
+  local op
+  while true; do
+    menu
+    read -r op || exit 0
+    echo
+    if [[ "$op" =~ ^[0-9a,\ -]+$ && "$op" != 0 ]]; then
+      parse_sel "$op" "${#ENT_NAME[@]}" && start_sel "${PICKS[@]}"
+      pause; continue
+    fi
+    case "$op" in
+      n|N) new_vm;      pause ;;
+      v|V) view_one;    pause ;;
+      p|P) pick_many "¿Cuáles apago?" && stop_sel 0 "${PICKS[@]}"; pause ;;
+      x|X) pick_many "¿Cuáles fuerzo? (es como desconectarlas)" && stop_sel 1 "${PICKS[@]}"; pause ;;
+      c|C) clone_vm;    pause ;;
+      s|S) snap_menu;   pause ;;
+      e|E) edit_vm;     pause ;;
+      b|B) delete_vm;   pause ;;
+      0|q|Q) exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+usage(){
+  cat <<USO
+Uso: vms [comando]
+
+  (sin nada)            menú interactivo
+  list                  lista las máquinas
+  start NOMBRE...       enciende y abre una o varias
+  stop NOMBRE...        apaga una o varias
+  new                   asistente para crear una máquina
+USO
+}
+
+case "${1:-}" in
+  "")       interactive ;;
+  list|ls)  print_list ;;
+  start|up) shift; (( $# )) || { usage; exit 1; }; sel_by_names "$@" && start_sel "${PICKS[@]}" ;;
+  stop)     shift; (( $# )) || { usage; exit 1; }; sel_by_names "$@" && stop_sel 0 "${PICKS[@]}" ;;
+  new)      new_vm ;;
+  -h|--help|help) usage ;;
+  *)        usage; exit 1 ;;
+esac

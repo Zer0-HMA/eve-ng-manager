@@ -300,6 +300,7 @@ menu(){
   echo "  8) Abrir la web"
   echo "  9) Abrir consola SSH"
   echo "  k) Configurar llave SSH (no pedir contraseña)"
+  echo "  v) Máquinas de prueba  ${D}(Linux, Windows, macOS)${N}"
   echo "  0) Salir"
   echo
   printf "  Opción: "
@@ -334,6 +335,7 @@ main(){
       8) open_web; sleep 1 ;;
       9) rssh ;;
       k|K) setup_key; pause ;;
+      v|V) if command -v vms &>/dev/null; then vms; else warn "Falta 'vms': corre ./setup.sh (opción 6)"; pause; fi ;;
       0|q) exit 0 ;;
       *) ;;
     esac
