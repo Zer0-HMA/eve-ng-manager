@@ -66,7 +66,9 @@ Al terminar, el instalador retira la ISO de la VM automáticamente.
 eve
 ```
 
-Enciende la VM, espera a que EVE-NG arranque, abre la web y muestra este menú:
+Para ir directo a las máquinas de prueba sin encender EVE-NG: `eve vms` (o solo `vms`).
+
+Sin argumentos, `eve` enciende la VM, espera a que EVE-NG arranque, abre la web y muestra este menú:
 
 | Opción | Acción |
 |--------|--------|
@@ -97,7 +99,7 @@ Si la VM se apaga mientras `eve` está abierto, el script lo detecta y se cierra
 Para probar sistemas fuera de EVE-NG: una Ubuntu, un Windows 11, un macOS, o varias a la vez.
 
 ```bash
-vms                       # menú
+vms                       # menú (también: eve vms)
 vms list                  # ver todas
 vms start ubuntu24 win11  # encender varias y abrir sus ventanas
 vms stop ubuntu24 win11

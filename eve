@@ -29,6 +29,26 @@ warn(){ echo "${Y}⚠${N} $*" >&2; }
 err() { echo "${R}✘${N} $*" >&2; }
 pause(){ read -r -p "${D}Enter para volver al menú...${N}" _; }
 
+# ── Atajos: abrir otro menú sin encender EVE-NG ──────────────
+case "${1:-}" in
+  vms|v|-v|--vms)
+    shift
+    if command -v vms &>/dev/null; then exec vms "$@"
+    elif [[ -x "$(dirname "$(readlink -f "$0")")/vms" ]]; then exec "$(dirname "$(readlink -f "$0")")/vms" "$@"
+    else err "Falta 'vms'. Corre ./setup.sh y elige la opción 6."; exit 1; fi ;;
+  -h|--help|help)
+    cat <<USO
+Uso: eve [comando]
+
+  (sin nada)     enciende EVE-NG y abre su menú
+  vms            abre el menú de máquinas de prueba (sin encender EVE-NG)
+  vms list       y cualquier otro comando de vms
+USO
+    exit 0 ;;
+  "") ;;
+  *) err "No conozco '$1'. Mira: eve --help"; exit 1 ;;
+esac
+
 # ── virsh (con sudo solo si hace falta) ──────────────────────
 SUDO_MODE=0
 if env LC_ALL=C virsh -c "$CONN" list &>/dev/null; then

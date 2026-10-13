@@ -8,3 +8,8 @@ config
 *.image
 *.swp
 .DS_Store
+
+# Copias y parches descargados
+*.zip
+*.patch
+eve-ng-manager/
