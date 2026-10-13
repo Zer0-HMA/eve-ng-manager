@@ -14,6 +14,10 @@
 # ──────────────────────────────────────────────────────────────
 set -uo pipefail
 
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  echo "Corre './setup.sh' normal (sin 'source')." >&2; return 1
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/eve-ng-manager"
